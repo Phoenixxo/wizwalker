@@ -106,3 +106,14 @@ class GeneratedHooksTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await duel.read_base_address(), 0)
         self.assertEqual(duel.read_typed.await_args.args[0], MODULE_BASE + 0x200)
         self.handler.pattern_scan.assert_not_awaited()
+
+    async def test_autobot_uses_the_generated_region_without_scanning_or_writing(self):
+        self.install_definition("autobot", 0x400, 0, 0x400, b"autobot entry")
+        self.handler.pattern_scan = AsyncMock()
+        self.handler.write_bytes = AsyncMock()
+
+        await self.handler._get_autobot_address()
+
+        self.assertEqual(self.handler._autobot_address, MODULE_BASE + 0x400)
+        self.handler.pattern_scan.assert_not_awaited()
+        self.handler.write_bytes.assert_not_awaited()

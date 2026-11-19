@@ -28,8 +28,9 @@ cargo run --release --locked -p wiz-extract -- --exe "C:\path\to\WizardGraphical
 addresses, overwrite lengths, field offsets, dependencies, and expected bytes. The cursor definition names the exports 
 WizWalker needs to resolve from its loaded `user32.dll`, so Python generation works with the game executable alone.
 
-If a core hook is unresolved, generation exits with an error and preserves any
-existing Python module. Unresolved optional hooks appear in `UNAVAILABLE`.
+If a core hook or the AutoBot region is unresolved, generation exits with an
+error and preserves any existing Python module. Unresolved optional hooks appear
+in `UNAVAILABLE`.
 Omit `--report` to generate just the Python module.
 
 ## To use

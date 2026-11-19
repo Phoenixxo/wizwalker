@@ -4,8 +4,8 @@ use std::collections::BTreeMap;
 use wiz_analysis::{
     wizard101::{
         locators::{
-            CursorGameSites, CORE, CURSOR_NAME, CURSOR_OVERWRITE_SIZE, CURSOR_SET_EXPORT,
-            CURSOR_TARGET_EXPORT, GAME_MODULE, USER32_MODULE,
+            CursorGameSites, AUTOBOT_NAME, CORE, CURSOR_NAME, CURSOR_OVERWRITE_SIZE,
+            CURSOR_SET_EXPORT, CURSOR_TARGET_EXPORT, GAME_MODULE, USER32_MODULE,
         },
         Evidence, Finding, Report,
     },
@@ -107,13 +107,14 @@ pub fn generate(
 ) -> CliResult<String> {
     let missing: Vec<_> = CORE
         .iter()
+        .map(|spec| spec.name)
+        .chain([AUTOBOT_NAME])
         .filter(|spec| {
             !report
                 .hooks
-                .get(spec.name)
+                .get(*spec)
                 .is_some_and(|entry| entry.finding.is_some())
         })
-        .map(|spec| spec.name)
         .collect();
     if !missing.is_empty() {
         return Err(format!(
@@ -241,6 +242,27 @@ mod tests {
                 })),
             );
         }
+        assert!(generate(&report, "build-hash", cursor())
+            .unwrap_err()
+            .to_string()
+            .contains(AUTOBOT_NAME));
+        report.hooks.insert(
+            AUTOBOT_NAME.into(),
+            Availability::from(Ok(Finding {
+                module: None,
+                target_rva: 0x180,
+                overwrite_size: 0,
+                locations: BTreeMap::new(),
+                dependencies: BTreeMap::new(),
+                dependency_modules: BTreeMap::new(),
+                evidence: vec![Evidence {
+                    module: None,
+                    rva: 0x180,
+                    bytes: vec![0x48, 0x8b],
+                    role: "AutoBot entry".into(),
+                }],
+            })),
+        );
         report.hooks.insert(
             CURSOR_NAME.into(),
             Availability::from(Err(Error::new(CURSOR_NAME, "missing DLL"))),

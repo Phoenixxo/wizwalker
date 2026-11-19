@@ -9,6 +9,8 @@ pub const CURSOR_NAME: &str = "mouseless_cursor";
 pub const CURSOR_TARGET_EXPORT: &str = "GetCursorPos";
 pub const CURSOR_SET_EXPORT: &str = "SetCursorPos";
 pub const CURSOR_OVERWRITE_SIZE: usize = 5;
+pub const AUTOBOT_NAME: &str = "autobot";
+pub const AUTOBOT_MIN_SIZE: usize = 3900;
 #[derive(Clone, Copy)]
 pub struct Locator {
     pub name: &'static str,

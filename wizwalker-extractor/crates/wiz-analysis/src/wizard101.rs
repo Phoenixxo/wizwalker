@@ -132,6 +132,20 @@ fn finding(image: &Image, rva: u32, overwrite: usize) -> Result<Finding> {
 /// Find instructions that reference the string. Decode from the PE function
 /// start to confirm each instruction boundary.
 fn references(image: &Image, text: &str) -> Result<Vec<(Function, Instruction)>> {
+    references_to_string(image, text, false)
+}
+
+/// Find decoded LEAs that point anywhere within a stable string. MSVC pools
+/// string suffixes, so a reference may start after the beginning of the literal.
+fn references_within(image: &Image, text: &str) -> Result<Vec<(Function, Instruction)>> {
+    references_to_string(image, text, true)
+}
+
+fn references_to_string(
+    image: &Image,
+    text: &str,
+    allow_interior: bool,
+) -> Result<Vec<(Function, Instruction)>> {
     let strings = image.strings(text);
     if strings.len() > 1024 {
         return Err(fail("string anchor budget exceeded"));
@@ -158,7 +172,11 @@ fn references(image: &Image, text: &str) -> Result<Vec<(Function, Instruction)>>
             let rva = s.rva + n as u32 - 1;
             let d = i32::from_le_bytes(data[n + 2..n + 6].try_into().unwrap());
             let dest = i64::from(rva) + 7 + i64::from(d);
-            if strings.iter().any(|r| i64::from(*r) == dest) {
+            if strings.iter().any(|r| {
+                let start = i64::from(*r);
+                dest == start
+                    || (allow_interior && dest > start && dest < start + text.len() as i64)
+            }) {
                 if let Some(f) = image.function(rva) {
                     candidates.entry(f.start).or_default().push(rva);
                 }
@@ -177,6 +195,80 @@ fn references(image: &Image, text: &str) -> Result<Vec<(Function, Instruction)>>
         }
     }
     Ok(out)
+}
+
+/// Locate the large AutobotManager setup function used as WizWalker's AutoBot region.
+/// Stable method-name references identify its role, while its unwind boundary and
+/// early ownership transfer validate that the candidate has the expected structure.
+fn autobot(image: &Image) -> Result<Finding> {
+    const ANCHORS: [&str; 3] = [
+        "AutobotManager::Initialize",
+        "AutobotManager::OnQuestComplete",
+        "AutobotManager::ToggleAutobotMode",
+    ];
+
+    let mut candidates = BTreeMap::<u32, BTreeMap<&str, Instruction>>::new();
+    for anchor in ANCHORS {
+        for (function, instruction) in references_within(image, anchor)? {
+            if function.end - function.start >= locators::AUTOBOT_MIN_SIZE as u32 {
+                candidates
+                    .entry(function.start)
+                    .or_default()
+                    .entry(anchor)
+                    .or_insert(instruction);
+            }
+        }
+    }
+
+    let mut validated = Vec::new();
+    for (target, references) in candidates {
+        if references.len() != ANCHORS.len() {
+            continue;
+        }
+        let entry = image.read(target, 256)?;
+        let entry_address = image.address(target)?;
+        let mut instructions = Vec::new();
+        let mut offset = 0;
+        while instructions.len() < 32 {
+            let instruction = x64::decode(&entry[offset..], entry_address + offset as u64)?;
+            offset += instruction.len();
+            instructions.push(instruction);
+        }
+        let saves_owner = instructions.iter().any(|instruction| {
+            instruction.op == Op::Mov
+                && register(instruction.operands.get(1)) == Some(1)
+                && register(instruction.operands.first())
+                    .is_some_and(|register| matches!(register, 3 | 5 | 6 | 7 | 12..=15))
+        });
+        if saves_owner {
+            validated.push((target, references));
+        }
+    }
+    let (target, references) = unique(validated, "AutobotManager region")?;
+
+    let mut proof = vec![evidence(
+        image,
+        target,
+        16,
+        "AutobotManager function entry",
+    )?];
+    for (anchor, instruction) in references {
+        proof.push(evidence(
+            image,
+            image.rva(instruction.ip)?,
+            instruction.len(),
+            &format!("reference within {anchor}"),
+        )?);
+    }
+    Ok(Finding {
+        module: None,
+        target_rva: target,
+        overwrite_size: 0,
+        locations: BTreeMap::new(),
+        dependencies: BTreeMap::new(),
+        dependency_modules: BTreeMap::new(),
+        evidence: proof,
+    })
 }
 fn registration(image: &Image, name: &str, qualified: &str) -> Result<(u32, Vec<Evidence>)> {
     let first = references(image, name)?;
@@ -397,6 +489,7 @@ pub fn analyze_with_user32(image: &Image, user32: Option<&Image>) -> Report {
     {
         hooks.insert(spec.name.into(), locators::locate(image, spec).into());
     }
+    hooks.insert(locators::AUTOBOT_NAME.into(), autobot(image).into());
     hooks.insert(
         "mouseless_cursor".into(),
         user32
@@ -1038,6 +1131,38 @@ mod tests {
             .message
             .contains("--user32"));
         assert!(report.hooks["drops_toggle"].error.is_some());
+    }
+
+    #[test]
+    fn autobot_resolves_a_unique_sized_function_without_an_overwrite_span() {
+        let mut image = image();
+        let target = 0x1000;
+        image.bytes[target as usize..target as usize + locators::AUTOBOT_MIN_SIZE].fill(0x90);
+        let initialize = 0x8000;
+        let complete = 0x8040;
+        let toggle = 0x8080;
+        put(&mut image, initialize, b"AutobotManager::Initialize\0");
+        put(&mut image, complete, b"AutobotManager::OnQuestComplete\0");
+        put(&mut image, toggle, b"AutobotManager::ToggleAutobotMode\0");
+        let mut entry = vec![0x4c, 0x8b, 0xf1];
+        lea(&mut entry, target, 0x48, 0x15, initialize);
+        lea(&mut entry, target, 0x48, 0x15, complete + 8);
+        lea(&mut entry, target, 0x48, 0x15, toggle);
+        entry.push(0xc3);
+        put(&mut image, target, &entry);
+        image.functions.push(Function {
+            start: target,
+            end: target + locators::AUTOBOT_MIN_SIZE as u32,
+        });
+
+        let found = autobot(&image).unwrap();
+        assert_eq!(found.target_rva, target);
+        assert_eq!(found.overwrite_size, 0);
+        assert_eq!(found.evidence[0].rva, target);
+        assert_eq!(found.evidence.len(), 4);
+
+        image.functions[0].end -= 1;
+        assert!(autobot(&image).is_err());
     }
 
     #[test]

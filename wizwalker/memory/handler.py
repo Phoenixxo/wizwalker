@@ -84,9 +84,11 @@ class HookHandler(MemoryReader):
         return addr
 
     async def _get_autobot_address(self):
-        addr = await self.pattern_scan(
-            self.AUTOBOT_PATTERN, module="WizardGraphicalClient.exe"
-        )
+        addr = await self.resolve_generated_hook("autobot")
+        if addr is None:
+            addr = await self.pattern_scan(
+                self.AUTOBOT_PATTERN, module="WizardGraphicalClient.exe"
+            )
         if addr is None:
             raise RuntimeError("Pattern scan failed for autobot pattern")
 

@@ -62,6 +62,57 @@ GAME_SHA256 = "d410a2463e7ff0e221d6d11ca10fa53de265abd17cacfba211f9eeca8ec8511a"
 RESOLVER_VERSION = 2
 
 HOOKS: dict[str, HookDef] = _build_hooks({
+    "autobot": {
+        "target": {
+            "module": "WizardGraphicalClient.exe",
+            "rva": 24169232
+        },
+        "overwrite_size": 0,
+        "locations": {},
+        "dependencies": {},
+        "evidence": [
+            {
+                "address": {
+                    "module": "WizardGraphicalClient.exe",
+                    "rva": 24169232
+                },
+                "data": [
+                    "488bc4554154415541564157488da818"
+                ],
+                "role": "AutobotManager function entry"
+            },
+            {
+                "address": {
+                    "module": "WizardGraphicalClient.exe",
+                    "rva": 24173018
+                },
+                "data": [
+                    "488d053f496301"
+                ],
+                "role": "reference within AutobotManager::Initialize"
+            },
+            {
+                "address": {
+                    "module": "WizardGraphicalClient.exe",
+                    "rva": 24170972
+                },
+                "data": [
+                    "488d151d4f6301"
+                ],
+                "role": "reference within AutobotManager::OnQuestComplete"
+            },
+            {
+                "address": {
+                    "module": "WizardGraphicalClient.exe",
+                    "rva": 24172411
+                },
+                "data": [
+                    "488d057e4a6301"
+                ],
+                "role": "reference within AutobotManager::ToggleAutobotMode"
+            }
+        ]
+    },
     "chat": {
         "target": {
             "module": "WizardGraphicalClient.exe",
