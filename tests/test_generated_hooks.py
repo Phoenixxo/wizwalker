@@ -6,7 +6,7 @@ import unittest
 from unittest.mock import AsyncMock, patch
 
 
-from wizwalker.errors import MemoryReadError
+from wizwalker.errors import MemoryReadError, PatternFailed, PatternMultipleResults
 from wizwalker.memory.generated import wiz_hooks
 from wizwalker.memory.handler import HookHandler
 from wizwalker.memory.hooks import MovementTeleportHook, QuestHook
@@ -15,6 +15,38 @@ from wizwalker.memory.memory_objects.duel import CurrentDuel
 
 GAME_MODULE = "WizardGraphicalClient.exe"
 MODULE_BASE = 0x140000000
+
+
+class OptionalDropsHookTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.handler = HookHandler(object(), object())
+        for name in (
+            "player", "quest", "player_stat", "client", "root_window",
+            "render_context", "movement_teleport", "drops_toggle", "auto_puzzle",
+            "update_zone_counter", "server_move_snapback", "calescent_tracker_active",
+            "calescent_tracker_position",
+        ):
+            setattr(self.handler, f"activate_{name}_hook", AsyncMock())
+
+    async def test_drops_pattern_failures_do_not_block_other_hooks(self):
+        for error in (PatternFailed(b"missing"), PatternMultipleResults()):
+            with self.subTest(error=type(error).__name__):
+                self.handler.activate_drops_toggle_hook.side_effect = error
+                self.handler.activate_auto_puzzle_hook.reset_mock()
+                self.handler.activate_calescent_tracker_position_hook.reset_mock()
+
+                await self.handler.activate_all_hooks(wait_for_ready=False)
+
+                self.handler.activate_auto_puzzle_hook.assert_awaited_once()
+                self.handler.activate_calescent_tracker_position_hook.assert_awaited_once()
+
+    async def test_unexpected_drops_errors_still_propagate(self):
+        self.handler.activate_drops_toggle_hook.side_effect = RuntimeError("write failed")
+
+        with self.assertRaisesRegex(RuntimeError, "write failed"):
+            await self.handler.activate_all_hooks(wait_for_ready=False)
+
+        self.handler.activate_auto_puzzle_hook.assert_not_awaited()
 
 
 class FixtureProcess:

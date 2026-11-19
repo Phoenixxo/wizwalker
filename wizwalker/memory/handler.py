@@ -9,6 +9,7 @@ import pymem.exception
 from loguru import logger
 
 from wizwalker import HookAlreadyActivated, HookNotActive, HookNotReady
+from wizwalker.errors import PatternFailed, PatternMultipleResults
 from .generated_hooks import GeneratedHookResolver
 from .hooks import (
     ChatHook,
@@ -212,7 +213,13 @@ class HookHandler(MemoryReader):
         await self.activate_root_window_hook(wait_for_ready=False)
         await self.activate_render_context_hook(wait_for_ready=False)
         await self.activate_movement_teleport_hook(wait_for_ready=False)
-        await self.activate_drops_toggle_hook(wait_for_ready=False)
+        try:
+            await self.activate_drops_toggle_hook(wait_for_ready=False)
+        except (PatternFailed, PatternMultipleResults):
+            logger.warning(
+                "Drops toggle hook unavailable: its pattern did not resolve uniquely. "
+                "Continuing client hookup with drop toggling disabled."
+            )
         await self.activate_auto_puzzle_hook(wait_for_ready=False)
         await self.activate_update_zone_counter_hook(wait_for_ready=False)
         await self.activate_server_move_snapback_hook(wait_for_ready=False)
