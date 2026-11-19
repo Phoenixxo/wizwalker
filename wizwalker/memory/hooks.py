@@ -10,6 +10,7 @@ from loguru import logger
 
 from wizwalker.errors import MemoryReadError
 from .memory_reader import MemoryReader
+from .generated import wiz_hooks
 from wizwalker.constants import kernel32
 
 
@@ -35,7 +36,7 @@ class MemoryHook(MemoryReader):
         if type(self) not in self._hook_cache:
             self._hook_cache[type(self)] = {}
         return self._hook_cache[type(self)]
-    
+
     def _is_cached(self, name):
         return name in self._get_my_cache()
 
@@ -657,12 +658,55 @@ class MovementTeleportHook(SimpleHook):
 
 
 class ServerMoveSnapbackHook(SimpleHook):
+    generated_name = "server_move_snapback"
+    generated_original = b"\x4C\x8B\xC1\x48\x8B\x09"
+    # The payload still uses GameClient+0x213A8
+    _verified_game_sha256 = "d410a2463e7ff0e221d6d11ca10fa53de265abd17cacfba211f9eeca8ec8511a"
+
     pattern = rb"\x4C\x8B\xC1\x48\x8B\x09\x80\x79.\x00\x74.\x4C\x3B\xC2" \
               rb"\x74.\x66\x41\x3B\x40."
 
     instruction_length = 6
     exports = [("server_move_snapback_bool", 1)]
     noops = 1
+
+    async def _resolve_jump_address(self) -> int:
+        if self.generated_name not in wiz_hooks.HOOKS:
+            raise MemoryReadError(
+                "Server move snapback requires a generated definition. "
+                "Run wiz-extract --python for this game build before installing hooks."
+            )
+        if wiz_hooks.GAME_SHA256 != self._verified_game_sha256:
+            raise MemoryReadError(
+                "Server move snapback payload has not been validated for this game build. "
+                "Its GameClient field offset must be checked before installation."
+            )
+        address = await self.hook_handler.resolve_generated_hook(
+            self.generated_name, original=self.generated_original
+        )
+        if address is None:
+            module = await self.loaded_module(self.module)
+            detail = "game module not loaded"
+            if module is not None:
+                detail = f"module={module.filename!r}"
+                target = wiz_hooks.HOOKS[self.generated_name].target
+                if isinstance(target, wiz_hooks.Rva) and target.module == self.module:
+                    detail += f", target RVA=0x{target.rva:X}"
+                    try:
+                        actual = await self.read_bytes(
+                            module.lpBaseOfDll + target.rva, len(self.generated_original)
+                        )
+                        detail += f", live bytes={actual.hex(' ')}"
+                    except MemoryReadError:
+                        detail += ", live bytes unreadable"
+            raise MemoryReadError(
+                f"Server move snapback failed build/live-byte validation ({detail}). "
+                "Expected original bytes: 4c 8b c1 48 8b 09. "
+                "A different build or an existing patch may be loaded; no hook was installed."
+            )
+        self._generated_target = True
+        self.instruction_length = len(self.generated_original)
+        return address
 
     async def bytecode_generator(self, packed_exports):
         return (
@@ -685,9 +729,7 @@ class ServerMoveSnapbackHook(SimpleHook):
         """
         Writes jump_bytecode to jump address and hook bytecode to hook address
         """
-        pattern, module = await self.get_pattern()
-
-        self.jump_address = await self.get_jump_address(pattern, module=module)
+        self.jump_address = await self._resolve_jump_address()
         self.hook_address = await self.get_hook_address(75)
 
         logger.debug(f"Got hook address {self.hook_address} in {type(self)}")
@@ -710,7 +752,7 @@ class ServerMoveSnapbackHook(SimpleHook):
         await self.prehook()
 
         await self.write_bytes(self.hook_address, self.hook_bytecode)
-        await self.write_bytes(self.jump_address, self.jump_bytecode)
+        await self._install_jump()
 
         await self.posthook()
 
@@ -801,11 +843,11 @@ class AhmarraAutoPuzzleHook(SimpleHook):
 class UpdateZoneCounterHook(SimpleHook):
     pattern = rb"\x48\x83\xEC\x20\x48\x8B\xC2\x48\x8B\xD9\x48\x8B\xC8\x48\x8D\x15...." \
               rb"\xE8....\x48\x8B\xC8\xE8....\x88\x83....\x33\xC0\x48\x83\xC4.\x5B\xC3"
-    
+
     instruction_length = 7
     exports = [("server_teleport_snapback_bool", 1)]
     noops = 2
-    
+
     async def bytecode_generator(self, packed_exports):
         return (
             b"\x50" # push rax
@@ -829,12 +871,12 @@ class User32GetClassInfoBaseHook(AutoBotBaseHook):
     )
     # rounded down
     AUTOBOT_SIZE = 1200
-    
+
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._hooked_instances = 0
         # How far into the function we are
-        self._autobot_bytes_offset = 0 
+        self._autobot_bytes_offset = 0
         self._autobot_addr = None
         self._autobot_original_bytes = None
 

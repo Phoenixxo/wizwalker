@@ -59,7 +59,7 @@ def _build_hooks(definitions):
 
 
 GAME_SHA256 = "d410a2463e7ff0e221d6d11ca10fa53de265abd17cacfba211f9eeca8ec8511a"
-RESOLVER_VERSION = 2
+RESOLVER_VERSION = 4
 
 HOOKS: dict[str, HookDef] = _build_hooks({
     "autobot": {
@@ -870,6 +870,74 @@ HOOKS: dict[str, HookDef] = _build_hooks({
                     "4883ec384c8bd1488b0d32c245024885c9741c488b014c894c24204d8bc8"
                 ],
                 "role": "unique locator and decoded overwrite"
+            }
+        ]
+    },
+    "server_move_snapback": {
+        "target": {
+            "module": "WizardGraphicalClient.exe",
+            "rva": 23548447
+        },
+        "overwrite_size": 6,
+        "locations": {
+            "key_offset": 32,
+            "mapped_value_offset": 40,
+            "mobile_id_bits": 16,
+            "mobile_id_register": 0,
+            "owner_map_offset": 136040,
+            "owner_register": 3,
+            "sentinel_offset": 25,
+            "tree_offset": 168
+        },
+        "dependencies": {
+            "handler": {
+                "module": "WizardGraphicalClient.exe",
+                "rva": 23548304
+            },
+            "mobile_id_conversion": {
+                "module": "WizardGraphicalClient.exe",
+                "rva": 20121712
+            }
+        },
+        "evidence": [
+            {
+                "address": {
+                    "module": "WizardGraphicalClient.exe",
+                    "rva": 23548447
+                },
+                "data": [
+                    "4c8bc1488b09"
+                ],
+                "role": "hook instructions"
+            },
+            {
+                "address": {
+                    "module": "WizardGraphicalClient.exe",
+                    "rva": 23366889
+                },
+                "data": [
+                    "488d05a0c402004889442450895c2458660f6f055f483401f30f7f8508110000",
+                    "c685f81000000041b80e000000488d15cb396d01488d8df8100000e887cec2fe",
+                    "900f28442450660f7f85b0020000488d058a396d0148894424204c8d8db00200",
+                    "004d8bc6488d95f8100000488bcfe814260400"
+                ],
+                "role": "paired handler registration"
+            },
+            {
+                "address": {
+                    "module": "WizardGraphicalClient.exe",
+                    "rva": 23548304
+                },
+                "data": [
+                    "488bc457415641574883ec5048c740b8feffffff488958104889681848897020",
+                    "0f2970d84c8bfa488bd9f20f10b128130200488d1597606a01498bcfe87ffbcb",
+                    "ff0f28ce488bc8e824d9dcfe488d1595606a01498bcfe865fbcbff488bc8e87d",
+                    "b6cbff488b93681302004885d27448488b92a80000004c8bc2488b4a08807919",
+                    "007524663941207306488b4910eb064c8bc1488b098079190074e84c3bc27407",
+                    "66413b402073034c8bc233f64c3bc274084d8b4028eb0533f64c8bc6488b0348",
+                    "8d542428488bcbff9008020000"
+                ],
+                "role": "GameClient preservation, MobileID parsing and validated tree lookup"
             }
         ]
     }

@@ -1,4 +1,5 @@
 import hashlib
+from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -9,7 +10,7 @@ from unittest.mock import AsyncMock, patch
 from wizwalker.errors import MemoryReadError, PatternFailed, PatternMultipleResults
 from wizwalker.memory.generated import wiz_hooks
 from wizwalker.memory.handler import HookHandler
-from wizwalker.memory.hooks import MovementTeleportHook, QuestHook
+from wizwalker.memory.hooks import MovementTeleportHook, QuestHook, ServerMoveSnapbackHook
 from wizwalker.memory.memory_objects.duel import CurrentDuel
 
 
@@ -97,6 +98,102 @@ class GeneratedHooksTests(unittest.IsolatedAsyncioTestCase):
         patcher = patch.dict(wiz_hooks.HOOKS, {name: entry})
         patcher.start()
         self.addCleanup(patcher.stop)
+
+    def snapback_hook(self):
+        patcher = patch.object(
+            ServerMoveSnapbackHook, "_verified_game_sha256", wiz_hooks.GAME_SHA256
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        hook = ServerMoveSnapbackHook(self.handler, hook_cache={})
+        hook.loaded_module = self.handler.loaded_module
+        hook.pattern_scan = AsyncMock(return_value=MODULE_BASE + 0x300)
+        self.install_definition(
+            hook.generated_name, 0x100, 6, 0x100, hook.generated_original
+        )
+        return hook
+
+    async def test_snapback_uses_verified_definition_without_scanning(self):
+        hook = self.snapback_hook()
+
+        self.assertEqual(await hook._resolve_jump_address(), MODULE_BASE + 0x100)
+        self.assertTrue(hook._generated_target)
+        hook.pattern_scan.assert_not_awaited()
+
+    async def test_snapback_rejects_modified_live_bytes_without_scanning(self):
+        hook = self.snapback_hook()
+        self.process.memory[MODULE_BASE + 0x100] = b"\xe9\x00\x00\x00\x00\x90"
+
+        with self.assertRaisesRegex(MemoryReadError, "live bytes=e9 00 00 00 00 90"):
+            await hook._resolve_jump_address()
+
+        hook.pattern_scan.assert_not_awaited()
+
+    async def test_snapback_rejects_unverified_payload_build(self):
+        hook = self.snapback_hook()
+
+        with patch.object(wiz_hooks, "GAME_SHA256", "unverified-build"):
+            with self.assertRaisesRegex(MemoryReadError, "payload has not been validated"):
+                await hook._resolve_jump_address()
+
+        hook.pattern_scan.assert_not_awaited()
+
+    async def test_snapback_requires_a_generated_definition(self):
+        hook = self.snapback_hook()
+
+        with patch.dict(wiz_hooks.HOOKS, {}, clear=True):
+            with self.assertRaisesRegex(MemoryReadError, "requires a generated definition"):
+                await hook._resolve_jump_address()
+
+        hook.pattern_scan.assert_not_awaited()
+
+    async def test_snapback_rejects_mismatched_loaded_executable(self):
+        hook = self.snapback_hook()
+        self.executable.write_bytes(b"different executable")
+
+        with self.assertRaisesRegex(MemoryReadError, "failed build/live-byte validation"):
+            await hook._resolve_jump_address()
+
+        hook.pattern_scan.assert_not_awaited()
+
+    async def test_snapback_rejects_an_export_target_with_a_validation_error(self):
+        hook = self.snapback_hook()
+        definition = replace(
+            wiz_hooks.HOOKS[hook.generated_name],
+            target=wiz_hooks.Export("user32.dll", "GetCursorPos"),
+        )
+
+        with patch.dict(wiz_hooks.HOOKS, {hook.generated_name: definition}):
+            with self.assertRaisesRegex(MemoryReadError, "failed build/live-byte validation"):
+                await hook._resolve_jump_address()
+
+        hook.pattern_scan.assert_not_awaited()
+
+    async def test_snapback_rechecks_original_bytes_before_installation(self):
+        hook = self.snapback_hook()
+        hook.jump_address = await hook._resolve_jump_address()
+        self.process.memory[MODULE_BASE + 0x100] = bytes(6)
+        hook.write_bytes = AsyncMock()
+
+        with self.assertRaisesRegex(MemoryReadError, "changed before installation"):
+            await hook._install_jump()
+
+        hook.write_bytes.assert_not_awaited()
+
+    async def test_snapback_installation_uses_verified_resolution(self):
+        hook = self.snapback_hook()
+        hook.get_hook_address = AsyncMock(return_value=MODULE_BASE + 0x400)
+        hook.get_hook_bytecode = AsyncMock(return_value=b"payload")
+        hook.get_jump_bytecode = AsyncMock(return_value=b"\xe9\x00\x00\x00\x00\x90")
+        hook.write_bytes = AsyncMock()
+
+        await hook.hook()
+
+        self.assertEqual(hook.jump_address, MODULE_BASE + 0x100)
+        self.assertEqual(hook.jump_original_bytecode, hook.generated_original)
+        hook.get_hook_address.assert_awaited_once_with(75)
+        hook.pattern_scan.assert_not_awaited()
+        self.assertEqual(hook.write_bytes.await_count, 2)
 
     async def test_quest_uses_verified_definition_and_replayed_span(self):
         original = self.quest.generated_original

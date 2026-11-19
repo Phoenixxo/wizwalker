@@ -8,7 +8,7 @@ use serde::Serialize;
 use std::collections::BTreeMap;
 #[path = "locators.rs"]
 pub mod locators;
-pub const RESOLVER_VERSION: u32 = 3;
+pub const RESOLVER_VERSION: u32 = 4;
 const MAX_FUNCTION: usize = 128 * 1024;
 #[derive(Clone, Debug, Serialize)]
 pub struct Evidence {
@@ -286,7 +286,35 @@ fn registration(image: &Image, name: &str, qualified: &str) -> Result<(u32, Vec<
         if at < 3 {
             continue;
         }
-        let prefix = &instructions[at - 3..at];
+        // Some registrations initialize the small-string argument between saving
+        // the descriptor and loading its name.
+        let setup = &instructions[at.saturating_sub(7)..at];
+        let descriptors = setup
+            .windows(3)
+            .enumerate()
+            .filter(|(_, w)| {
+                w[0].op == Op::Lea
+                    && register(w[0].operands.first()) == Some(0)
+                    && w[1].op == Op::Mov
+                    && register(w[1].operands.get(1)) == Some(0)
+                    && w[2].op == Op::Mov
+            })
+            .collect::<Vec<_>>();
+        if descriptors.len() != 1 {
+            continue;
+        }
+        let (descriptor_at, prefix) = descriptors[0];
+        if !setup[descriptor_at + 3..].iter().all(|i| {
+            vector_move(i)
+                || (i.op == Op::Mov
+                    && (register(i.operands.first()) == Some(8)
+                        || memory(i.operands.first()).is_some_and(|m| {
+                            matches!(m.base, Some(4 | 5)) && m.index.is_none() && m.bits == 8
+                        }))
+                    && immediate(i.operands.get(1)).is_some())
+        }) {
+            continue;
+        }
         // The handler and adjustment form a member-function descriptor saved on the stack.
         let (load, store, adjust) = (&prefix[0], &prefix[1], &prefix[2]);
         if load.op != Op::Lea
@@ -324,7 +352,6 @@ fn registration(image: &Image, name: &str, qualified: &str) -> Result<(u32, Vec<
         if paired.len() != 1 {
             continue;
         }
-        let end = paired[0].1.next_ip()?;
         let start = image.rva(load.ip)?;
         // R9 must point to the copied descriptor when the registration call runs.
         let tail = &instructions[at + 1..];
@@ -363,7 +390,7 @@ fn registration(image: &Image, name: &str, qualified: &str) -> Result<(u32, Vec<
             vec![evidence(
                 image,
                 start,
-                (end - load.ip) as usize,
+                (tail[call].next_ip()? - load.ip) as usize,
                 "paired handler registration",
             )?],
         ));
@@ -481,6 +508,212 @@ fn chat_receive(image: &Image) -> Result<Finding> {
     Ok(f)
 }
 
+fn server_move_snapback(image: &Image) -> Result<Finding> {
+    let (handler, proof) = registration(image, "MSG_ServerMove", "GameClient::MSG_ServerMove")?;
+    let ins = decoded(image, image.function(handler).unwrap())?;
+    let mut matches = Vec::new();
+    let reg = |i: &Instruction, n: usize, index: u8, bits: u16| {
+        matches!(i.operands.get(n), Some(Operand::Register(r))
+            if r.index == index && r.bits == bits && !r.vector && !r.high_byte)
+    };
+    let mem = |i: &Instruction, n: usize, base: u8, offset: i64, bits: u16| {
+        memory(i.operands.get(n)).is_some_and(|m| {
+            m.base == Some(base)
+                && m.index.is_none()
+                && !m.rip
+                && m.segment.is_none()
+                && m.displacement == offset
+                && m.bits == bits
+        })
+    };
+    let field = unique(field_calls(image, &ins, "MobileID"), "MobileID lookup")?;
+    for field in [field] {
+        let Some(parse) = ins.get(field + 1..field + 3) else {
+            continue;
+        };
+        if parse[0].op != Op::Mov
+            || !reg(&parse[0], 0, 1, 64)
+            || !reg(&parse[0], 1, 0, 64)
+            || parse[1].op != Op::Call
+        {
+            continue;
+        }
+        let Some(conversion) = target(&parse[1], image) else {
+            continue;
+        };
+        let Some(w) = ins.get(field + 3..field + 35) else {
+            continue;
+        };
+        let ops = [
+            Op::Mov,
+            Op::Test,
+            Op::Conditional(4),
+            Op::Mov,
+            Op::Mov,
+            Op::Mov,
+            Op::Cmp,
+            Op::Conditional(5),
+            Op::Cmp,
+            Op::Conditional(3),
+            Op::Mov,
+            Op::Jump,
+            Op::Mov,
+            Op::Mov,
+            Op::Cmp,
+            Op::Conditional(4),
+            Op::Cmp,
+            Op::Conditional(4),
+            Op::Cmp,
+            Op::Conditional(3),
+            Op::Mov,
+            Op::Xor,
+            Op::Cmp,
+            Op::Conditional(4),
+            Op::Mov,
+            Op::Jump,
+            Op::Xor,
+            Op::Mov,
+            Op::Mov,
+            Op::Lea,
+            Op::Mov,
+            Op::Call,
+        ];
+        if !w.iter().zip(ops).all(|(i, op)| i.op == op) {
+            continue;
+        }
+        let Some(owner_map) = memory(w[0].operands.get(1)) else {
+            continue;
+        };
+        let Some(tree) = memory(w[3].operands.get(1)) else {
+            continue;
+        };
+        if !reg(&w[0], 0, 2, 64)
+            || !mem(&w[0], 1, 3, owner_map.displacement, 64)
+            || owner_map.displacement <= 0
+            || !reg(&w[1], 0, 2, 64)
+            || !reg(&w[1], 1, 2, 64)
+            || !reg(&w[3], 0, 2, 64)
+            || !mem(&w[3], 1, 2, tree.displacement, 64)
+            || tree.displacement <= 0
+            || !reg(&w[4], 0, 8, 64)
+            || !reg(&w[4], 1, 2, 64)
+            || !reg(&w[5], 0, 1, 64)
+            || !mem(&w[5], 1, 2, 8, 64)
+            || ![6, 14]
+                .iter()
+                .all(|&n| mem(&w[n], 0, 1, 0x19, 8) && immediate(w[n].operands.get(1)) == Some(0))
+            || !mem(&w[8], 0, 1, 0x20, 16)
+            || !reg(&w[8], 1, 0, 16)
+            || !reg(&w[10], 0, 1, 64)
+            || !mem(&w[10], 1, 1, 0x10, 64)
+            || w[12].bytes != [0x4c, 0x8b, 0xc1]
+            || w[13].bytes != [0x48, 0x8b, 0x09]
+            || ![16, 22]
+                .iter()
+                .all(|&n| reg(&w[n], 0, 8, 64) && reg(&w[n], 1, 2, 64))
+            || !reg(&w[18], 0, 0, 16)
+            || !mem(&w[18], 1, 8, 0x20, 16)
+            || !reg(&w[20], 0, 8, 64)
+            || !reg(&w[20], 1, 2, 64)
+            || ![21, 26]
+                .iter()
+                .all(|&n| reg(&w[n], 0, 6, 32) && reg(&w[n], 1, 6, 32))
+            || !reg(&w[24], 0, 8, 64)
+            || !mem(&w[24], 1, 8, 0x28, 64)
+            || !reg(&w[27], 0, 8, 64)
+            || !reg(&w[27], 1, 6, 64)
+            || !reg(&w[28], 0, 0, 64)
+            || !mem(&w[28], 1, 3, 0, 64)
+            || !reg(&w[29], 0, 2, 64)
+            || !memory(w[29].operands.get(1)).is_some_and(|m| {
+                m.base == Some(4) && m.index.is_none() && !m.rip && m.segment.is_none()
+            })
+            || !reg(&w[30], 0, 1, 64)
+            || !reg(&w[30], 1, 3, 64)
+            || !memory(w[31].operands.first()).is_some_and(|m| {
+                m.base == Some(0)
+                    && m.index.is_none()
+                    && !m.rip
+                    && m.segment.is_none()
+                    && m.bits == 64
+            })
+        {
+            continue;
+        }
+        if ![
+            (2, 26),
+            (7, 20),
+            (9, 12),
+            (11, 14),
+            (15, 8),
+            (17, 20),
+            (19, 21),
+            (23, 27),
+            (25, 28),
+        ]
+        .iter()
+        .all(|&(branch, dest)| target(&w[branch], image) == image.rva(w[dest].ip).ok())
+        {
+            continue;
+        }
+        // Before the lookup, all control flow is straight-line (apart from ABI
+        // calls), and the sole write to RBX must preserve the incoming this.
+        let prefix = &ins[..field + 3];
+        let writes = prefix
+            .iter()
+            .filter(|i| {
+                register(i.operands.first()) == Some(3)
+                    && !matches!(i.op, Op::Cmp | Op::Test | Op::Push)
+            })
+            .collect::<Vec<_>>();
+        if writes.len() != 1
+            || writes[0].op != Op::Mov
+            || !reg(writes[0], 0, 3, 64)
+            || !reg(writes[0], 1, 1, 64)
+            || writes[0].ip >= ins[field].ip
+            || prefix.iter().any(|i| {
+                matches!(
+                    i.op,
+                    Op::Jump | Op::Conditional(_) | Op::Return | Op::Exchange | Op::Pop
+                )
+            })
+            || prefix.iter().take_while(|i| i.ip < writes[0].ip).any(|i| {
+                i.op == Op::Call
+                    || (register(i.operands.first()) == Some(1)
+                        && !matches!(i.op, Op::Cmp | Op::Test | Op::Push))
+            })
+        {
+            continue;
+        }
+        let at = image.rva(w[12].ip)?;
+        let mut f = finding(image, at, 6)?;
+        for (name, offset) in [
+            ("owner_register", 3),
+            ("mobile_id_register", 0),
+            ("mobile_id_bits", 16),
+            ("sentinel_offset", 0x19),
+            ("key_offset", 0x20),
+            ("mapped_value_offset", 0x28),
+            ("owner_map_offset", owner_map.displacement),
+            ("tree_offset", tree.displacement),
+        ] {
+            f.locations.insert(name.into(), offset);
+        }
+        f.dependencies.insert("handler".into(), handler);
+        f.dependencies
+            .insert("mobile_id_conversion".into(), conversion);
+        f.evidence.extend(proof.clone());
+        f.evidence.push(evidence(
+            image,
+            handler,
+            (w[31].next_ip()? - image.address(handler)?) as usize,
+            "GameClient preservation, MobileID parsing and validated tree lookup",
+        )?);
+        matches.push(f);
+    }
+    unique(matches, "server move snapback")
+}
+
 pub fn analyze(image: &Image) -> Report {
     analyze_with_user32(image, None)
 }
@@ -508,6 +741,10 @@ pub fn analyze_with_user32(image: &Image, user32: Option<&Image>) -> Report {
         locators::duel_manager(image).into(),
     );
     hooks.insert("chat".into(), chat_receive(image).into());
+    hooks.insert(
+        "server_move_snapback".into(),
+        server_move_snapback(image).into(),
+    );
     hooks.insert("movement_teleport".into(), movement(image).into());
     hooks.insert("chat_send".into(), chat_send(image).into());
     hooks.insert("resize.video_manager".into(), video_manager(image).into());
@@ -1172,6 +1409,157 @@ mod tests {
         });
         image
     }
+    fn server_move_registration(image: &mut Image, start: u32) {
+        let mut c = Vec::new();
+        lea(&mut c, start, 0x48, 0x05, 0x2000);
+        c.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x50, 0x89, 0x5c, 0x24, 0x58]);
+        // Real MSG_ServerMove registration has four string setup instructions
+        // between the member-function descriptor and the message-name LEA.
+        c.extend_from_slice(&[0x66, 0x0f, 0x6f, 0x05]);
+        let next = start + c.len() as u32 + 4;
+        c.extend_from_slice(&(0x8400i32 - next as i32).to_le_bytes());
+        c.extend_from_slice(&[
+            0xf3, 0x0f, 0x7f, 0x45, 0x60, 0xc6, 0x45, 0x70, 0x00, 0x41, 0xb8, 0x0e, 0x00, 0x00,
+            0x00,
+        ]);
+        lea(&mut c, start, 0x48, 0x15, 0x8000);
+        c.extend_from_slice(&[0x48, 0x8d, 0x4d, 0x20]);
+        call(&mut c, start, 0x4000);
+        c.extend_from_slice(&[0x0f, 0x28, 0x44, 0x24, 0x50, 0x66, 0x0f, 0x7f, 0x45, 0x30]);
+        lea(&mut c, start, 0x48, 0x05, 0x8100);
+        c.extend_from_slice(&[
+            0x48, 0x89, 0x44, 0x24, 0x20, 0x4c, 0x8d, 0x4d, 0x30, 0x4d, 0x8b, 0xc6, 0x48, 0x8d,
+            0x55, 0x20, 0x48, 0x8b, 0xcf,
+        ]);
+        call(&mut c, start, 0x4100);
+        c.push(0xc3);
+        put(image, start, &c);
+        image.functions.retain(|f| f.start != start);
+        image.functions.push(Function {
+            start,
+            end: start + c.len() as u32,
+        });
+        image.functions.sort_by_key(|f| f.start);
+    }
+
+    fn server_move_fixture() -> (Image, u32) {
+        let mut image = fixture(-96);
+        put(&mut image, 0x8000, b"MSG_ServerMove\0");
+        put(&mut image, 0x8100, b"GameClient::MSG_ServerMove\0");
+        put(&mut image, 0x8200, b"MobileID\0");
+        server_move_registration(&mut image, 0x1000);
+        let mut c = vec![0x48, 0x8b, 0xd9, 0x4c, 0x8b, 0xfa]; // this -> RBX, message -> R15
+        lea(&mut c, 0x2000, 0x48, 0x15, 0x8200);
+        c.extend_from_slice(&[0x49, 0x8b, 0xcf]);
+        call(&mut c, 0x2000, 0x4200);
+        c.extend_from_slice(&[0x48, 0x8b, 0xc8]);
+        call(&mut c, 0x2000, 0x4300);
+        let lookup = 0x2000 + c.len() as u32;
+        // A complete lower_bound lookup, including the null and sentinel paths.
+        c.extend_from_slice(&[
+            0x48, 0x8b, 0x93, 0x68, 0x13, 0x02, 0x00, 0x48, 0x85, 0xd2, 0x74, 0x48, 0x48, 0x8b,
+            0x92, 0xa8, 0x00, 0x00, 0x00, 0x4c, 0x8b, 0xc2, 0x48, 0x8b, 0x4a, 0x08, 0x80, 0x79,
+            0x19, 0x00, 0x75, 0x24, 0x66, 0x39, 0x41, 0x20, 0x73, 0x06, 0x48, 0x8b, 0x49, 0x10,
+            0xeb, 0x06, 0x4c, 0x8b, 0xc1, 0x48, 0x8b, 0x09, 0x80, 0x79, 0x19, 0x00, 0x74, 0xe8,
+            0x4c, 0x3b, 0xc2, 0x74, 0x07, 0x66, 0x41, 0x3b, 0x40, 0x20, 0x73, 0x03, 0x4c, 0x8b,
+            0xc2, 0x33, 0xf6, 0x4c, 0x3b, 0xc2, 0x74, 0x08, 0x4d, 0x8b, 0x40, 0x28, 0xeb, 0x05,
+            0x33, 0xf6, 0x4c, 0x8b, 0xc6, 0x48, 0x8b, 0x03, 0x48, 0x8d, 0x54, 0x24, 0x28, 0x48,
+            0x8b, 0xcb, 0xff, 0x90, 0x08, 0x02, 0x00, 0x00, 0xc3,
+        ]);
+        put(&mut image, 0x2000, &c);
+        image.functions[1].end = 0x2000 + c.len() as u32;
+        (image, lookup + 0x2c)
+    }
+
+    #[test]
+    fn server_move_resolves_mobile_id_lookup_under_aslr() {
+        for base in [0x140000000, 0x7ff600000000] {
+            let (mut image, site) = server_move_fixture();
+            image.base = base;
+            let f = server_move_snapback(&image).unwrap();
+            assert_eq!(f.target_rva, site);
+            assert_eq!(f.overwrite_size, 6);
+            assert_eq!(f.evidence[0].bytes, [0x4c, 0x8b, 0xc1, 0x48, 0x8b, 0x09]);
+            assert_eq!(f.dependencies["handler"], 0x2000);
+            assert_eq!(f.dependencies["mobile_id_conversion"], 0x4300);
+            assert_eq!(f.locations["owner_register"], 3);
+            assert_eq!(f.locations["mobile_id_register"], 0);
+            assert_eq!(f.locations["mobile_id_bits"], 16);
+            assert_eq!(f.locations["sentinel_offset"], 0x19);
+            assert_eq!(f.locations["key_offset"], 0x20);
+            assert_eq!(f.locations["mapped_value_offset"], 0x28);
+            assert!(!f.locations.contains_key("local_id_offset"));
+            assert!(f.evidence.iter().map(|e| e.bytes.len()).sum::<usize>() < 512);
+            assert_eq!(
+                analyze(&image).hooks["server_move_snapback"]
+                    .finding
+                    .as_ref()
+                    .unwrap()
+                    .target_rva,
+                site
+            );
+        }
+    }
+
+    #[test]
+    fn server_move_rejects_changed_registers_layout_and_control_flow() {
+        let (image, site) = server_move_fixture();
+        let lookup = site - 0x2c;
+        for (at, byte) in [
+            (0x2002, 0xf9),      // this retained in RDI instead of RBX
+            (0x2000, 0x89),      // invalid this capture
+            (lookup - 6, 0xd0),  // conversion receives RDX, not RAX
+            (lookup + 2, 0x96),  // map loaded from a different owner register
+            (site + 2, 0xc2),    // stolen register contract changed
+            (site + 5, 0x01),    // stolen load no longer updates RCX
+            (lookup + 28, 0x18), // initial sentinel byte
+            (site + 8, 0x18),    // loop sentinel byte
+            (lookup + 35, 0x22), // lower_bound key
+            (site + 21, 0x22),   // final key
+            (site + 37, 0x30),   // mapped qword
+            (site + 34, 0x49),   // mapped value moved to RAX (drops REX.R)
+            (site + 11, 0xe9),   // branch lands inside an instruction
+            (lookup + 37, 0x07), // lower_bound no longer enters the hook
+        ] {
+            let mut changed = image.clone();
+            changed.bytes[at as usize] = byte;
+            assert!(
+                server_move_snapback(&changed).is_err(),
+                "accepted mutation at {at:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn server_move_requires_named_registration_and_unambiguous_mobile_id() {
+        let (mut image, _) = server_move_fixture();
+        put(&mut image, 0x8100, b"Unrelated::MSG_ServerMove\0");
+        assert!(server_move_snapback(&image).is_err());
+        let (mut image, _) = server_move_fixture();
+        put(&mut image, 0x8200, b"OtherID\0");
+        assert!(server_move_snapback(&image).is_err());
+        let (mut image, _) = server_move_fixture();
+        server_move_registration(&mut image, 0x3000);
+        assert!(server_move_snapback(&image)
+            .unwrap_err()
+            .to_string()
+            .contains(
+                "registration for MSG_ServerMove: expected one validated candidate, found 2"
+            ));
+        let (mut image, _) = server_move_fixture();
+        let end = image.functions[1].end;
+        let mut duplicate = Vec::new();
+        lea(&mut duplicate, end, 0x48, 0x15, 0x8200);
+        call(&mut duplicate, end, 0x4200);
+        duplicate.push(0xc3);
+        put(&mut image, end, &duplicate);
+        image.functions[1].end += duplicate.len() as u32;
+        assert!(server_move_snapback(&image)
+            .unwrap_err()
+            .to_string()
+            .contains("MobileID lookup: expected one validated candidate, found 2"));
+    }
+
     #[test]
     fn registrations_and_storage_are_derived_under_aslr() {
         for base in [0x140000000, 0x7ff600000000] {
