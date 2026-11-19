@@ -1,0 +1,12 @@
+[package]
+name = "wiz-extract"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+wiz-analysis = { path = "../wiz-analysis" }
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "=0.10.9"

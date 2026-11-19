@@ -9,6 +9,7 @@ import pymem.exception
 from loguru import logger
 
 from wizwalker import HookAlreadyActivated, HookNotActive, HookNotReady
+from .generated_hooks import GeneratedHookResolver
 from .hooks import (
     ChatHook,
     ChatSendHook,
@@ -51,6 +52,7 @@ class HookHandler(MemoryReader):
         super().__init__(process)
 
         self.client = client
+        self._generated_hooks = GeneratedHookResolver()
 
         self._autobot_address = None
         self._autobot_lock = None
@@ -63,6 +65,11 @@ class HookHandler(MemoryReader):
 
         self._hook_cache = {}
         self._dance_moves_transtable = str.maketrans("abcd", "WDSA")
+
+    async def resolve_generated_hook(
+        self, name: str, *, original: bytes | None = None
+    ) -> int | None:
+        return await self._generated_hooks.resolve(self, name, original=original)
 
     async def _get_open_autobot_address(self, size: int) -> int:
         if self._autobot_pos + size > self.AUTOBOT_SIZE:
