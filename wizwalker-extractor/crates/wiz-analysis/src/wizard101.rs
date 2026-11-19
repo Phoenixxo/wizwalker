@@ -819,8 +819,6 @@ fn movement(image: &Image) -> Result<Finding> {
         }
         event_dispatches.push((image.rva(w[0].ip)?, image.rva(w[7].next_ip()?)?));
     }
-    let (event_dispatch, event_join) = unique(event_dispatches, "event dispatch branch")?;
-
     let mut inside_events = Vec::new();
     for w in ins.windows(6) {
         if w[0].op != Op::Lea
@@ -837,7 +835,6 @@ fn movement(image: &Image) -> Result<Finding> {
             || register(w[3].operands.get(1)) != Some(0)
             || w[4].op != Op::Conditional(4)
             || w[4].len() != 2
-            || target(&w[4], image) != Some(event_join)
             || !vector_move(&w[5])
             || vector_register(w[5].operands.first()) != Some(2)
             || !memory(w[5].operands.get(1))
@@ -845,9 +842,26 @@ fn movement(image: &Image) -> Result<Finding> {
         {
             continue;
         }
-        inside_events.push(image.rva(w[4].ip)?);
+        let Some(join) = target(&w[4], image) else {
+            continue;
+        };
+        inside_events.push((image.rva(w[4].ip)?, join));
     }
-    let inside_event = unique(inside_events, "inside event branch")?;
+
+    let mut event_pairs = Vec::new();
+    for (event_dispatch, event_join) in event_dispatches {
+        for (inside_event, inside_join) in &inside_events {
+            if *inside_join == event_join
+                && *inside_event < event_dispatch
+                && event_dispatch < event_join
+            {
+                event_pairs.push((*inside_event, event_dispatch));
+            }
+        }
+    }
+    event_pairs.sort_unstable();
+    event_pairs.dedup();
+    let (inside_event, event_dispatch) = unique(event_pairs, "movement event branches")?;
 
     let mut f = finding(image, setter.start, overwrite)?;
     f.dependencies.extend([
@@ -879,25 +893,43 @@ fn buddy(image: &Image) -> Result<(u32, Vec<Evidence>)> {
         if calls.len() != 1 {
             continue;
         }
-        let save = ins.iter().take(16).find(|i| {
-            i.op == Op::Mov
-                && memory(i.operands.first()).is_some_and(|m| m.base == Some(4) && m.bits == 64)
-                && register(i.operands.get(1)) == Some(2)
-        });
-        let Some(save) = save else { continue };
-        let slot = memory(save.operands.first()).unwrap();
         let at = calls[0];
-        let flow = ins.get(at + 1..at + 4);
-        if !flow.is_some_and(|w| {
-            w[0].op == Op::Lea
-                && register(w[0].operands.first()) == Some(2)
-                && memory(w[0].operands.get(1))
-                    .is_some_and(|m| m.base == slot.base && m.displacement == slot.displacement)
-                && w[1].op == Op::Mov
-                && register(w[1].operands.first()) == Some(1)
-                && register(w[1].operands.get(1)) == Some(0)
-                && w[2].op == Op::Call
-        }) {
+        let slots: Vec<_> = ins[..at]
+            .iter()
+            .filter_map(|instruction| {
+                if instruction.op != Op::Mov || register(instruction.operands.get(1)) != Some(2) {
+                    return None;
+                }
+                memory(instruction.operands.first()).filter(|slot| {
+                    matches!(slot.base, Some(4 | 5)) && slot.index.is_none() && slot.bits == 64
+                })
+            })
+            .collect();
+        let tail = &ins[at + 1..ins.len().min(at + 9)];
+        let Some(call) = tail
+            .iter()
+            .position(|instruction| instruction.op == Op::Call)
+        else {
+            continue;
+        };
+        let arguments = &tail[..call];
+        let owner = arguments.iter().any(|instruction| {
+            instruction.op == Op::Mov
+                && register(instruction.operands.first()) == Some(1)
+                && register(instruction.operands.get(1)) == Some(0)
+        });
+        let gid = slots.iter().any(|slot| {
+            arguments.iter().any(|instruction| {
+                instruction.op == Op::Lea
+                    && register(instruction.operands.first()) == Some(2)
+                    && memory(instruction.operands.get(1)).is_some_and(|candidate| {
+                        candidate.base == slot.base
+                            && candidate.index == slot.index
+                            && candidate.displacement == slot.displacement
+                    })
+            })
+        });
+        if !owner || !gid {
             continue;
         }
         found.push((

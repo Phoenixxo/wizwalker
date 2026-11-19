@@ -79,7 +79,7 @@ pub const CORE: [Locator; 6] = [
 ];
 pub const DANCE: Locator = Locator {
     name: "dance_game_moves",
-    signature: "48 8B F8 48 39 70 10",
+    signature: "48 8B ?? 48 39 70 10",
     offset: 0,
     overwrite: 7,
 };
@@ -180,6 +180,34 @@ pub fn locate(image: &Image, spec: Locator) -> Result<Finding> {
         return Err(Error::new(spec.name, "overwrite splits an instruction"));
     }
     let mut locations = BTreeMap::new();
+    if spec.name == DANCE.name {
+        let instructions = x64::decode_all(image.read(target, size)?, image.address(target)?)?;
+        let [save, compare] = instructions.as_slice() else {
+            return Err(Error::new(spec.name, "unsupported dance move hook span"));
+        };
+        let saved_register = match save.operands.as_slice() {
+            [x64::Operand::Register(destination), x64::Operand::Register(source)]
+                if save.op == x64::Op::Mov
+                    && destination.bits == 64
+                    && matches!(destination.index, 3 | 7)
+                    && source.bits == 64
+                    && source.index == 0 =>
+            {
+                destination.index
+            }
+            _ => return Err(Error::new(spec.name, "unsupported dance move value save")),
+        };
+        match compare.operands.as_slice() {
+            [x64::Operand::Memory(value), x64::Operand::Register(index)]
+                if compare.op == x64::Op::Cmp
+                    && value.base == Some(0)
+                    && value.index.is_none()
+                    && value.displacement == 0x10
+                    && index.index == 6 => {}
+            _ => return Err(Error::new(spec.name, "unsupported dance move bounds check")),
+        }
+        locations.insert("saved_register".into(), i64::from(saved_register));
+    }
     if spec.name == "core.root_window" {
         let i = x64::decode(image.read(target, size)?, image.address(target)?)?;
         match i.operands.as_slice() {
@@ -317,7 +345,7 @@ pub fn cursor_game_sites(image: &Image) -> Result<CursorGameSites> {
     let mut proof = Vec::new();
     for (flag, signature, offset) in [
         ("cursor_flag_one", "C6 ?? ?? 00 FF 50 18 66 C7", 3),
-        ("cursor_flag_two", "C6 86 ?? ?? ?? 00 00 33 FF 89", 6),
+        ("cursor_flag_two", "C6 86 ?? ?? ?? 00 00 33 ?? 89", 6),
     ] {
         let (site, _) = unique_signature(image, CURSOR_NAME, signature)?;
         let instruction = x64::decode(image.read(site, offset + 1)?, image.address(site)?)?;
@@ -326,6 +354,24 @@ pub fn cursor_game_sites(image: &Image) -> Result<CursorGameSites> {
                 CURSOR_NAME,
                 format!("{flag} is not a byte immediate"),
             ));
+        }
+        if flag == "cursor_flag_two" {
+            let clear = x64::decode(
+                image.read(site + instruction.len() as u32, 3)?,
+                image.address(site + instruction.len() as u32)?,
+            )?;
+            match clear.operands.as_slice() {
+                [x64::Operand::Register(destination), x64::Operand::Register(source)]
+                    if clear.op == x64::Op::Xor
+                        && destination.bits == 32
+                        && destination.index == source.index => {}
+                _ => {
+                    return Err(Error::new(
+                        CURSOR_NAME,
+                        "cursor flag is not followed by a register clear",
+                    ));
+                }
+            }
         }
         flag_rvas.insert(flag.into(), site + offset as u32);
         proof.push(evidence(image, site, instruction.len(), flag)?);
