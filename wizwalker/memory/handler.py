@@ -71,6 +71,9 @@ class HookHandler(MemoryReader):
     ) -> int | None:
         return await self._generated_hooks.resolve(self, name, original=original)
 
+    async def resolve_generated_hook_layout(self, name: str):
+        return await self._generated_hooks.resolve_layout(self, name)
+
     async def _get_open_autobot_address(self, size: int) -> int:
         if self._autobot_pos + size > self.AUTOBOT_SIZE:
             raise RuntimeError("Somehow went over autobot size")

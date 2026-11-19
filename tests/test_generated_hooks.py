@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, patch
 from wizwalker.errors import MemoryReadError
 from wizwalker.memory.generated import wiz_hooks
 from wizwalker.memory.handler import HookHandler
-from wizwalker.memory.hooks import QuestHook
+from wizwalker.memory.hooks import MovementTeleportHook, QuestHook
 from wizwalker.memory.memory_objects.duel import CurrentDuel
 
 
@@ -45,13 +45,21 @@ class GeneratedHooksTests(unittest.IsolatedAsyncioTestCase):
         self.quest = QuestHook(self.handler, hook_cache={})
         self.quest.pattern_scan = AsyncMock(return_value=MODULE_BASE + 0x300)
 
-    def install_definition(self, name, rva, overwrite_size, proof_rva, proof_bytes):
+    def install_definition(
+        self,
+        name,
+        rva,
+        overwrite_size,
+        proof_rva,
+        proof_bytes,
+        dependencies=None,
+    ):
         self.process.memory[MODULE_BASE + proof_rva] = proof_bytes
         entry = wiz_hooks.HookDef(
             target=wiz_hooks.Rva(GAME_MODULE, rva),
             overwrite_size=overwrite_size,
             locations={},
-            dependencies={},
+            dependencies=dependencies or {},
             evidence=(wiz_hooks.Evidence(wiz_hooks.Rva(GAME_MODULE, proof_rva), proof_bytes, "test"),),
         )
         patcher = patch.dict(wiz_hooks.HOOKS, {name: entry})
@@ -94,6 +102,33 @@ class GeneratedHooksTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(MemoryReadError):
             await self.quest._install_jump()
         self.quest.write_bytes.assert_not_awaited()
+
+    async def test_movement_uses_the_generated_layout(self):
+        original = b"\x57\x48\x83\xEC\x20"
+        dependencies = {
+            "first_action": wiz_hooks.Rva(GAME_MODULE, 0x200),
+            "second_action": wiz_hooks.Rva(GAME_MODULE, 0x210),
+            "inside_event": wiz_hooks.Rva(GAME_MODULE, 0x220),
+            "event_dispatch": wiz_hooks.Rva(GAME_MODULE, 0x230),
+        }
+        self.install_definition(
+            "movement_teleport",
+            0x100,
+            len(original),
+            0x100,
+            original,
+            dependencies,
+        )
+        movement = MovementTeleportHook(self.handler, hook_cache={})
+        movement.pattern_scan = AsyncMock(return_value=MODULE_BASE + 0x300)
+
+        self.assertEqual(await movement._resolve_jump_address(), MODULE_BASE + 0x100)
+        self.assertEqual(movement._original_instructions, original)
+        self.assertEqual(
+            await movement.movement_state_branches(),
+            (MODULE_BASE + 0x200, MODULE_BASE + 0x210),
+        )
+        movement.pattern_scan.assert_not_awaited()
 
     async def test_duel_reads_pointer_from_the_generated_slot(self):
         self.install_definition("combat.duel_manager", 0x200, 0, 0x100, b"pointer load")

@@ -8,7 +8,7 @@ use serde::Serialize;
 use std::collections::BTreeMap;
 #[path = "locators.rs"]
 pub mod locators;
-pub const RESOLVER_VERSION: u32 = 2;
+pub const RESOLVER_VERSION: u32 = 3;
 const MAX_FUNCTION: usize = 128 * 1024;
 #[derive(Clone, Debug, Serialize)]
 pub struct Evidence {
@@ -88,6 +88,12 @@ fn vector_move(i: &Instruction) -> bool {
 fn register(o: Option<&Operand>) -> Option<u8> {
     match o {
         Some(Operand::Register(r)) if !r.vector && !r.high_byte => Some(r.index),
+        _ => None,
+    }
+}
+fn vector_register(o: Option<&Operand>) -> Option<u8> {
+    match o {
+        Some(Operand::Register(r)) if r.vector => Some(r.index),
         _ => None,
     }
 }
@@ -698,14 +704,29 @@ fn movement(image: &Image) -> Result<Finding> {
     }
     let setter = unique(setters, "position setter")?;
     let setter_ins = decoded(image, setter)?;
-    let overwrite = setter_ins
+    let overwrite_instructions: Vec<_> = setter_ins
         .iter()
-        .scan(0, |n, i| {
-            *n += i.len();
-            Some(*n)
+        .scan(0, |size, instruction| {
+            if *size >= 5 {
+                return None;
+            }
+            *size += instruction.len();
+            Some(instruction)
         })
-        .find(|n| *n >= 6)
-        .ok_or_else(|| fail("position setter is too short"))?;
+        .collect();
+    let overwrite: usize = overwrite_instructions
+        .iter()
+        .map(|instruction| instruction.len())
+        .sum();
+    if overwrite < 5 {
+        return Err(fail("position setter is too short"));
+    }
+    if overwrite_instructions
+        .iter()
+        .any(|instruction| !instruction.relocatable())
+    {
+        return Err(fail("position setter hook span requires relocation"));
+    }
     let mut states = Vec::new();
     for fun in raw_candidates(image, &[0x8b, 0x5f, 0x70])? {
         let Ok(ins) = decoded(image, fun) else {
@@ -754,7 +775,7 @@ fn movement(image: &Image) -> Result<Finding> {
         }
     }
     let (state, ins, first, second) = unique(states, "movement-state branches")?;
-    let mut collisions = Vec::new();
+    let mut event_dispatches = Vec::new();
     for w in ins.windows(8) {
         if w[0].op != Op::Conditional(4)
             || w[0].len() != 2
@@ -796,15 +817,45 @@ fn movement(image: &Image) -> Result<Finding> {
         if target(&w[0], image) != Some(image.rva(w[7].next_ip()?)?) {
             continue;
         }
-        collisions.push(image.rva(w[0].ip)?);
+        event_dispatches.push((image.rva(w[0].ip)?, image.rva(w[7].next_ip()?)?));
     }
-    let collision = unique(collisions, "collision branch")?;
+    let (event_dispatch, event_join) = unique(event_dispatches, "event dispatch branch")?;
+
+    let mut inside_events = Vec::new();
+    for w in ins.windows(6) {
+        if w[0].op != Op::Lea
+            || register(w[0].operands.first()) != Some(8)
+            || !memory(w[0].operands.get(1)).is_some_and(|m| m.base == Some(4) && m.index.is_none())
+            || w[1].op != Op::Lea
+            || register(w[1].operands.first()) != Some(2)
+            || !memory(w[1].operands.get(1)).is_some_and(|m| m.base == Some(5) && m.index.is_none())
+            || w[2].op != Op::Call
+            || !memory(w[2].operands.first())
+                .is_some_and(|m| m.base == Some(0) && m.displacement == 0x10)
+            || w[3].op != Op::Test
+            || register(w[3].operands.first()) != Some(0)
+            || register(w[3].operands.get(1)) != Some(0)
+            || w[4].op != Op::Conditional(4)
+            || w[4].len() != 2
+            || target(&w[4], image) != Some(event_join)
+            || !vector_move(&w[5])
+            || vector_register(w[5].operands.first()) != Some(2)
+            || !memory(w[5].operands.get(1))
+                .is_some_and(|m| m.base == Some(5) && m.index.is_none() && m.bits == 32)
+        {
+            continue;
+        }
+        inside_events.push(image.rva(w[4].ip)?);
+    }
+    let inside_event = unique(inside_events, "inside event branch")?;
+
     let mut f = finding(image, setter.start, overwrite)?;
     f.dependencies.extend([
         ("movement_state".into(), state.start),
         ("first_action".into(), first),
         ("second_action".into(), second),
-        ("collision".into(), collision),
+        ("inside_event".into(), inside_event),
+        ("event_dispatch".into(), event_dispatch),
     ]);
     f.evidence.push(evidence(
         image,

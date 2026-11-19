@@ -664,7 +664,10 @@ class Client:
                 timeout=wait_on_inuse_timeout,
             )
 
-        jes = await self._get_je_instruction_forward_backwards()
+        movement_teleport_hook = self.hook_handler._get_hook_by_type(
+            MovementTeleportHook
+        )
+        jes = await movement_teleport_hook.movement_state_branches()
 
         await self._teleport_helper.write_target_object_address(object_address)
         await self._teleport_helper.write_position(xyz)
@@ -681,7 +684,6 @@ class Client:
                     timeout=purge_on_after_unuser_fixer_timeout,
                 )
             except ExceptionalTimeout:
-                movement_teleport_hook = self.hook_handler._get_hook_by_type(MovementTeleportHook)
                 for je, old_bytes in zip(jes, movement_teleport_hook._old_jes_bytes):
                     await self.hook_handler.write_bytes(je, old_bytes)
 

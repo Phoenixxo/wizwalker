@@ -424,6 +424,7 @@ class CalescentTrackerPositionHook(SimpleHook):
 
 
 class MovementTeleportHook(SimpleHook):
+    _legacy_original = b"\x40\x57\x48\x83\xEC\x30"
     pattern = rb"\x40\x57\x48\x83\xEC\x30\x48\xC7\x44\x24\x20\xFE" \
               rb"\xFF\xFF\xFF\x48\x89\x5C\x24\x40\x48\x8B\x99\xB8" \
               rb"\x01\x00\x00\x48\x85\xDB\x74\x13\x4C\x8B\x43\x70" \
@@ -439,6 +440,64 @@ class MovementTeleportHook(SimpleHook):
     _old_collision_jes_bytes = None
     _collision_je_addrs = None
     _old_je_page_protection = None
+
+    def __init__(self, hook_handler, hook_cache={}):
+        super().__init__(hook_handler, hook_cache)
+        self._generated_layout = None
+        self._movement_je_addrs = None
+        self._original_instructions = self._legacy_original
+
+    async def _resolve_jump_address(self) -> int:
+        layout = await self.hook_handler.resolve_generated_hook_layout(
+            "movement_teleport"
+        )
+        if layout is not None:
+            missing = {"first_action", "second_action"}.difference(
+                layout.dependencies
+            )
+            collision_sites = {"inside_event", "event_dispatch"}
+            if not collision_sites.issubset(layout.dependencies):
+                if not (
+                    layout.original == self._legacy_original
+                    and "collision" in layout.dependencies
+                ):
+                    missing.update(collision_sites.difference(layout.dependencies))
+            if missing:
+                names = ", ".join(sorted(missing))
+                raise RuntimeError(
+                    "Generated movement hook is incomplete "
+                    f"(missing {names}). Run wiz-extract again for this game build."
+                )
+            self._generated_layout = layout
+            self._movement_je_addrs = (
+                layout.dependencies["first_action"],
+                layout.dependencies["second_action"],
+            )
+            self._original_instructions = layout.original
+            self.instruction_length = len(layout.original)
+            self.noops = len(layout.original) - 5
+            return layout.target
+
+        return await super()._resolve_jump_address()
+
+    async def _install_jump(self):
+        if self._generated_layout is not None:
+            original = await self.read_bytes(
+                self.jump_address, len(self._original_instructions)
+            )
+            if original != self._original_instructions:
+                raise MemoryReadError(
+                    "The movement hook bytes changed before installation."
+                )
+        await super()._install_jump()
+
+    async def get_hook_address(self, size: int) -> int:
+        return await super().get_hook_address(200)
+
+    async def movement_state_branches(self):
+        if self._movement_je_addrs is not None:
+            return self._movement_je_addrs
+        return await self.hook_handler.client._get_je_instruction_forward_backwards()
 
     def _set_page_protection(self, address: int, protections: int, size: int = 24) -> int:
         old_protection = ctypes.wintypes.DWORD()
@@ -471,19 +530,30 @@ class MovementTeleportHook(SimpleHook):
             return await asyncio.wait_for(_inner(), 5)
 
     async def prehook(self):
-        jes = await self.hook_handler.client._get_je_instruction_forward_backwards()
+        jes = await self.movement_state_branches()
 
         target_address = jes[0]
 
-        inside_event_je_addr = await self.pattern_scan(
-            rb"\x74.\xF3\x0F\x10\x55\x90",
-            module="WizardGraphicalClient.exe",
+        dependencies = (
+            self._generated_layout.dependencies
+            if self._generated_layout is not None
+            else {}
         )
-        
-        event_dispatch_je_addr = await self.pattern_scan(
-            rb"\x74.\xF3\x0F\x10\x44\x24\x58\xF3\x0F",
-            module="WizardGraphicalClient.exe",
-        )
+        if "inside_event" in dependencies and "event_dispatch" in dependencies:
+            inside_event_je_addr = dependencies["inside_event"]
+            event_dispatch_je_addr = dependencies["event_dispatch"]
+        else:
+            inside_event_je_addr = await self.pattern_scan(
+                rb"\x74.\xF3\x0F\x10\x55\x90",
+                module="WizardGraphicalClient.exe",
+            )
+            if "collision" in dependencies:
+                event_dispatch_je_addr = dependencies["collision"]
+            else:
+                event_dispatch_je_addr = await self.pattern_scan(
+                    rb"\x74.\xF3\x0F\x10\x44\x24\x58\xF3\x0F",
+                    module="WizardGraphicalClient.exe",
+                )
 
         old_inside_event_je_bytes = await self.read_bytes(inside_event_je_addr, 2)
         old_event_dispatch_je_addr = await self.read_bytes(event_dispatch_je_addr, 2)
@@ -507,7 +577,7 @@ class MovementTeleportHook(SimpleHook):
         packed_target_addr = bytearray(packed_exports[0][1])
         packed_target_addr[0] += 13
 
-        jes = await self.hook_handler.client._get_je_instruction_forward_backwards()
+        jes = await self.movement_state_branches()
 
         jes_and_bytes = await self.hook_handler.read_bytes(jes[0], 8)
         jes_cmp_bytes = await self.hook_handler.read_bytes(jes[1], 8)
@@ -544,46 +614,15 @@ class MovementTeleportHook(SimpleHook):
             b"\x48\xA3" + packed_jes_and +
             b"\x48\xB8" + jes_cmp_bytes +
             b"\x48\xA3" + packed_jes_cmp +
-            b"\x58" # pop rax
-            b"\x40\x57" # push rdi (original bytes)
-            b"\x48\x83\xEC\x30" # sub rsp,30 (original bytes)
+            b"\x58"  # pop rax
+            + self._original_instructions
         )
         # fmt: on
 
         return bytecode
 
     async def hook(self):
-        """
-        Writes jump_bytecode to jump address and hook bytecode to hook address
-        """
-        pattern, module = await self.get_pattern()
-
-        self.jump_address = await self.get_jump_address(pattern, module=module)
-        self.hook_address = await self.get_hook_address(200)
-
-        logger.debug(f"Got hook address {self.hook_address} in {type(self)}")
-        logger.debug(f"Got jump address {self.jump_address} in {type(self)}")
-
-        self.hook_bytecode = await self.get_hook_bytecode()
-        self.jump_bytecode = await self.get_jump_bytecode()
-
-        logger.debug(f"Got hook bytecode {self.hook_bytecode} in {type(self)}")
-        logger.debug(f"Got jump bytecode {self.jump_bytecode} in {type(self)}")
-
-        self.jump_original_bytecode = await self.read_bytes(
-            self.jump_address, len(self.jump_bytecode)
-        )
-
-        logger.debug(
-            f"Got jump original bytecode {self.jump_original_bytecode} in {type(self)}"
-        )
-
-        await self.prehook()
-
-        await self.write_bytes(self.hook_address, self.hook_bytecode)
-        await self.write_bytes(self.jump_address, self.jump_bytecode)
-
-        await self.posthook()
+        await super().hook()
 
     async def unhook(self):
         # with suppress(ExceptionalTimeout):
@@ -606,7 +645,7 @@ class MovementTeleportHook(SimpleHook):
         if self._old_jes_bytes is None:
             return
 
-        jes = await self.hook_handler.client._get_je_instruction_forward_backwards()
+        jes = await self.movement_state_branches()
 
         for je, je_bytes in zip(jes, self._old_jes_bytes):
             await self.hook_handler.write_bytes(je, je_bytes)
